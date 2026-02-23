@@ -1,0 +1,153 @@
+name: Secure Persistent RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+    # -----------------------------
+    # ENABLE RDP
+    # -----------------------------
+    - name: Enable RDP & Firewall
+      shell: powershell
+      run: |
+        Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name fDenyTSConnections -Value 0
+
+        # keep secure auth enabled
+        Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name UserAuthentication -Value 1
+
+        Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name SecurityLayer -Value 1
+
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Restart-Service TermService -Force
+
+    # -----------------------------
+    # CREATE ADMIN USER
+    # -----------------------------
+    - name: Create Secure RDP User
+      shell: powershell
+      run: |
+        $pass = -join ((33..126) | Get-Random -Count 20 | % {[char]$_})
+        $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+
+        New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
+        Add-LocalGroupMember -Group Administrators -Member RDP
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member RDP
+
+        echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+        echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+
+    # -----------------------------
+    # INSTALL TAILSCALE (ROBUST)
+    # -----------------------------
+    - name: Install Tailscale
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+        $msi = "$env:TEMP\tailscale.msi"
+
+        Write-Host "Downloading Tailscale..."
+        curl.exe -L $url -o $msi
+
+        if (!(Test-Path $msi)) {
+            Write-Error "Download failed"
+            exit 1
+        }
+
+        if ((Get-Item $msi).Length -lt 1000000) {
+            Write-Error "Installer corrupted"
+            exit 1
+        }
+
+        Write-Host "Installing..."
+        Start-Process msiexec.exe -Wait -ArgumentList @(
+            "/i", $msi,
+            "/qn",
+            "/norestart"
+        )
+
+        Start-Sleep 5
+
+        if (!(Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+            Write-Error "Installation failed"
+            exit 1
+        }
+
+        Write-Host "Tailscale installed successfully"
+
+    # -----------------------------
+    # CONNECT TO TAILSCALE
+    # -----------------------------
+    - name: Connect to Tailscale
+      shell: powershell
+      run: |
+        $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+        & $ts up `
+          --authkey="${{ secrets.TS_AUTHKEY }}" `
+          --hostname=gh-runner `
+          --accept-routes `
+          --accept-dns=false
+
+        $ip = $null
+        for ($i=0; $i -lt 30; $i++) {
+            $ip = & $ts ip -4
+            if ($ip) { break }
+            Start-Sleep 5
+        }
+
+        if (-not $ip) {
+            Write-Error "No Tailscale IP assigned"
+            exit 1
+        }
+
+        echo "TS_IP=$ip" >> $env:GITHUB_ENV
+
+    # -----------------------------
+    # VERIFY RDP CONNECTIVITY
+    # -----------------------------
+    - name: Verify RDP Port
+      shell: powershell
+      run: |
+        Write-Host "Testing RDP connectivity..."
+        $result = Test-NetConnection $env:TS_IP -Port 3389
+
+        if (-not $result.TcpTestSucceeded) {
+            Write-Error "RDP port unreachable"
+            exit 1
+        }
+
+    # -----------------------------
+    # SHOW CONNECTION DETAILS
+    # -----------------------------
+    - name: Connection Info
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "========== RDP ACCESS =========="
+        Write-Host "Address : $env:TS_IP"
+        Write-Host "User    : $env:RDP_USER"
+        Write-Host "Password: $env:RDP_PASS"
+        Write-Host "================================"
+        Write-Host ""
+
+    # -----------------------------
+    # KEEP RUNNER ALIVE
+    # -----------------------------
+    - name: Keep Session Alive
+      shell: powershell
+      run: |
+        while ($true) {
+          Write-Host "[$(Get-Date)] Runner active"
+          Start-Sleep 300
+        }
